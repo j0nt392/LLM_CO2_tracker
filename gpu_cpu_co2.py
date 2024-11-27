@@ -30,10 +30,12 @@ import time
 from typing import Optional
 from langchain_community.llms import Ollama
 import os
-from PySide6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QPushButton, QLabel
-from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QPushButton, QLabel, QHBoxLayout, QTextEdit, QLineEdit, QSizePolicy, QMessageBox, QDialog, QListWidget, QDialogButtonBox, QProgressDialog
+from PySide6.QtCore import QTimer, QThread, Signal
 import pyqtgraph as pg
 import sys
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QTextCursor, QActionGroup
 
 @dataclass
 class SystemSpecs:
@@ -269,6 +271,117 @@ class CarbonTracker:
             return result
         return wrapper
 
+class OllamaThread(QThread):
+    """Thread for handling Ollama requests"""
+    response_ready = Signal(str)  # Signal to emit when response is ready
+    error_occurred = Signal(str)  # Signal for errors
+
+    def __init__(self, llm, prompt):
+        super().__init__()
+        self.llm = llm
+        self.prompt = prompt
+
+    def run(self):
+        try:
+            response = self.llm.invoke(
+                self.prompt,
+                temperature=0.7,
+                max_tokens=500
+            )
+            self.response_ready.emit(response)
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+
+class ModelSelectorDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Model")
+        self.setModal(True)
+        
+        layout = QVBoxLayout(self)
+        
+        # Create list widget for models
+        self.model_list = QListWidget()
+        layout.addWidget(self.model_list)
+        
+        # Add OK and Cancel buttons
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel,
+            Qt.Horizontal, self
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        
+        # Add some default models that we know exist
+        default_models = ["llama2:1b", "llama2", "mistral", "codellama"]
+        
+        # Try to get installed models
+        try:
+            import requests
+            response = requests.get("http://localhost:11434/api/tags")
+            if response.status_code == 200:
+                installed_models = [model["name"] for model in response.json()["models"]]
+                
+                # Add models to list with installation status
+                for model in default_models:
+                    item = QListWidgetItem(model)
+                    if model not in installed_models:
+                        item.setText(f"{model} (not installed)")
+                        item.setForeground(Qt.gray)
+                    self.model_list.addItem(item)
+            else:
+                raise Exception("Failed to fetch models")
+        except Exception as e:
+            # Fallback: just add the models without status
+            for model in default_models:
+                self.model_list.addItem(model)
+
+    def get_selected_model(self):
+        if self.model_list.currentItem():
+            # Strip the "(not installed)" suffix if present
+            model_name = self.model_list.currentItem().text().split(" (")[0]
+            
+            # Check if model needs to be installed
+            if "(not installed)" in self.model_list.currentItem().text():
+                reply = QMessageBox.question(
+                    self,
+                    "Install Model",
+                    f"The model '{model_name}' is not installed. Would you like to install it now?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                
+                if reply == QMessageBox.Yes:
+                    try:
+                        # Show installation progress
+                        progress_msg = QMessageBox(self)
+                        progress_msg.setIcon(QMessageBox.Information)
+                        progress_msg.setText(f"Installing {model_name}...\nThis might take a few minutes.")
+                        progress_msg.setStandardButtons(QMessageBox.NoButton)
+                        progress_msg.show()
+                        QApplication.processEvents()
+                        
+                        # Run ollama pull command
+                        import subprocess
+                        subprocess.run(["ollama", "pull", model_name], check=True)
+                        
+                        progress_msg.close()
+                        QMessageBox.information(self, "Success", f"Model {model_name} installed successfully!")
+                        
+                    except Exception as e:
+                        QMessageBox.critical(
+                            self,
+                            "Installation Error",
+                            f"Failed to install model {model_name}. Error: {str(e)}"
+                        )
+                        return None
+                else:
+                    return None
+            
+            return model_name
+        return None
+
 class CarbonTrackerGUI(QMainWindow):
     def __init__(self, tracker):
         super().__init__()
@@ -277,6 +390,34 @@ class CarbonTrackerGUI(QMainWindow):
         
         self.tracker = tracker
         self.llm = Ollama(model="llama3.2:1b")
+
+        # Add this model_info dictionary
+        self.model_info = {
+            "llama2:7b": {
+                "name": "Llama 2 7B",
+                "parameters": "7 billion",
+                "context_length": "4096 tokens"
+            },
+            "llama2:1b": {
+                "name": "Llama 2 1B",
+                "parameters": "1.1 billion",
+                "context_length": "4096 tokens"
+            },
+            "mistral": {
+                "name": "Mistral 7B",
+                "parameters": "7.3 billion",
+                "context_length": "8192 tokens"
+            },
+            "codellama": {
+                "name": "Code Llama 7B",
+                "parameters": "7 billion",
+                "context_length": "4096 tokens"
+            }
+        }
+        
+        self.current_model = "llama3.2:1b"  # Default model
+
+        self.create_menu_bar()
         
         # Setup data storage
         self.timestamps = []
@@ -297,65 +438,272 @@ class CarbonTrackerGUI(QMainWindow):
         self.timer.start(1000)  # Update every second
         
         self.start_time = time.time()
+        
+    def create_menu_bar(self):
+        menubar = self.menuBar()
+        
+        # File menu
+        file_menu = menubar.addMenu("File")
+        exit_action = file_menu.addAction("Exit")
+        exit_action.setShortcut("Ctrl+Q")
+        exit_action.triggered.connect(self.close)
+        
+        # View menu
+        view_menu = menubar.addMenu("View")
+        
+        # Reset Graphs action
+        reset_graphs = view_menu.addAction("Reset Graphs")
+        reset_graphs.setShortcut("Ctrl+R")
+        reset_graphs.triggered.connect(self.reset_graphs)
+        
+        # Toggle Dark Mode
+        dark_mode = view_menu.addAction("Dark Mode")
+        dark_mode.setCheckable(True)  # Makes it toggleable
+        dark_mode.triggered.connect(self.toggle_dark_mode)
+        
+        # Add separator
+        view_menu.addSeparator()
+        
+        # Show/Hide different plots submenu
+        plots_menu = view_menu.addMenu("Show/Hide Plots")
+        
+        self.show_usage_plot = plots_menu.addAction("Resource Usage")
+        self.show_usage_plot.setCheckable(True)
+        self.show_usage_plot.setChecked(True)
+        self.show_usage_plot.triggered.connect(self.toggle_usage_plot)
+        
+        self.show_energy_plot = plots_menu.addAction("Energy Consumption")
+        self.show_energy_plot.setCheckable(True)
+        self.show_energy_plot.setChecked(True)
+        self.show_energy_plot.triggered.connect(self.toggle_energy_plot)
+        
+        self.show_co2_plot = plots_menu.addAction("CO2 Emissions")
+        self.show_co2_plot.setCheckable(True)
+        self.show_co2_plot.setChecked(True)
+        self.show_co2_plot.triggered.connect(self.toggle_co2_plot)
+        
+        # Models menu
+        models_menu = menubar.addMenu("Models")
+        
+        # Select Model action
+        select_model = models_menu.addAction("Select Model")
+        select_model.setShortcut("Ctrl+M")
+        select_model.triggered.connect(self.show_model_selector)
+        
+        # Add separator
+        models_menu.addSeparator()
+        
+        # Quick switch submenu
+        quick_switch = models_menu.addMenu("Quick Switch")
+        
+        # Add common models
+        models = {
+            "Llama 2 (1B)": "llama2:1b",
+            "Llama 2 (7B)": "llama2:7b",
+            "Mistral (7B)": "mistral",
+            "CodeLlama": "codellama",
+            "Neural Chat": "neural-chat"
+        }
+        
+        # Create action group for radio-button behavior
+        model_group = QActionGroup(self)
+        model_group.setExclusive(True)
+        
+        for display_name, model_id in models.items():
+            action = quick_switch.addAction(display_name)
+            action.setCheckable(True)
+            action.setData(model_id)
+            model_group.addAction(action)
+            if model_id == "llama2:1b":  # Set default model
+                action.setChecked(True)
+            action.triggered.connect(lambda checked, m=model_id: self.switch_model(m))
+        
+        # Add separator
+        models_menu.addSeparator()
+        
+        # Refresh Models action
+        refresh_models = models_menu.addAction("Refresh Available Models")
+        refresh_models.triggered.connect(self.refresh_models)
+
+    def reset_graphs(self):
+        """Reset all graph data"""
+        self.timestamps.clear()
+        self.cpu_data.clear()
+        self.gpu_data.clear()
+        self.ram_data.clear()
+        self.co2_data.clear()
+        self.cpu_energy_data.clear()
+        self.gpu_energy_data.clear()
+        self.ram_energy_data.clear()
+        self.start_time = time.time()
+
+    def toggle_dark_mode(self, checked):
+        """Toggle dark/light mode"""
+        if checked:
+            # Dark mode colors
+            self.setStyleSheet("""
+                QMainWindow, QWidget {
+                    background-color: #2b2b2b;
+                    color: #ffffff;
+                }
+                QTextEdit, QLineEdit {
+                    background-color: #3b3b3b;
+                    color: #ffffff;
+                    border: 1px solid #555555;
+                }
+                QPushButton {
+                    background-color: #444444;
+                    color: #ffffff;
+                    border: 1px solid #555555;
+                }
+            """)
+            # Update plot colors
+            self.usage_plot.setBackground('#2b2b2b')
+            self.energy_plot.setBackground('#2b2b2b')
+            self.co2_plot.setBackground('#2b2b2b')
+        else:
+            # Light mode colors
+            self.setStyleSheet("")
+            # Reset plot backgrounds
+            self.usage_plot.setBackground('white')
+            self.energy_plot.setBackground('white')
+            self.co2_plot.setBackground('white')
+
+    def toggle_usage_plot(self, checked):
+        """Show/hide resource usage plot"""
+        self.usage_plot.setVisible(checked)
+        if checked:
+            self.usage_plot.setMinimumHeight(200)
+            self.usage_plot.enableAutoRange()
+        else:
+            self.usage_plot.setMinimumHeight(0)
+
+    def toggle_energy_plot(self, checked):
+        """Show/hide energy consumption plot"""
+        self.energy_plot.setVisible(checked)
+        if checked:
+            self.energy_plot.setMinimumHeight(200)
+            self.energy_plot.enableAutoRange()
+        else:
+            self.energy_plot.setMinimumHeight(0)
+
+    def toggle_co2_plot(self, checked):
+        """Show/hide CO2 emissions plot"""
+        self.co2_plot.setVisible(checked)
+        if checked:
+            self.co2_plot.setMinimumHeight(200)
+            self.co2_plot.enableAutoRange()
+        else:
+            self.co2_plot.setMinimumHeight(0)
 
     def setup_ui(self):
-        """
-        Sets up the GUI interface with three main graphs:
-        1. Resource Usage (Red=CPU, Green=GPU, Blue=RAM)
-        2. Energy Consumption (Red=CPU, Green=GPU, Blue=RAM)
-        3. Cumulative CO2 Emissions (Yellow)
-        """
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
         
-        # System info
-        specs = self.tracker.specs
-        info_label = QLabel(
-            f"=== System Specifications ===\n"
-            f"CPU: {specs.cpu_model} (TDP: {specs.cpu_tdp}W)\n"
-            f"GPU: {specs.gpu_model} (Type: {specs.gpu_type}, TDP: {specs.gpu_tdp}W)\n"
-            f"RAM: {specs.ram_total_gb:.1f} GB"
-        )
-        layout.addWidget(info_label)
+        # Create horizontal layout for top info
+        top_layout = QHBoxLayout()
+        layout.addLayout(top_layout)
         
-        # Usage Graph
+        # Legends (left side)
+        legend_label = QLabel(
+            "=== Graph Legend ===\n<br>"
+            "Resource Usage & Energy:\n<br>"
+            "<span style='color: red'>■</span> Red = CPU\n<br>"
+            "<span style='color: green'>■</span> Green = GPU\n<br>"
+            "<span style='color: blue'>■</span> Blue = RAM\n\n<br>"
+            "CO2 Emissions:\n<br>"
+            "<span style='color: yellow'>■</span> Yellow = Total CO2"
+        )
+        legend_label.setTextFormat(Qt.RichText)  # Enable HTML formatting
+        top_layout.addWidget(legend_label)
+        
+        # System info (right side)
+        specs = self.tracker.specs
+        self.info_label = QLabel()  # Create as class attribute
+        self.info_label.setContentsMargins(0, 0, 0, 0)  # Remove padding
+        top_layout.addWidget(self.info_label)
+        self.update_system_info()  # Initial update of system info
+        
+        # Create a horizontal layout for the main content
+        main_layout = QHBoxLayout()
+        layout.addLayout(main_layout)
+        
+        # Left side: Graphs
+        graphs_layout = QVBoxLayout()
+        graphs_layout.setSpacing(20)  # Add 20 pixels spacing between items
+        
         self.usage_plot = pg.PlotWidget(title="Resource Usage")
+        self.usage_plot.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.usage_plot.setMinimumHeight(200)  # Set a fixed minimum height
         self.usage_plot.setLabel('left', 'Usage (%)')
         self.usage_plot.setLabel('bottom', 'Time (s)')
-        self.usage_plot.addLegend()
-        # Red for CPU, Green for GPU, Blue for RAM
-        self.cpu_curve = self.usage_plot.plot(pen='r', name='CPU Usage')
-        self.gpu_curve = self.usage_plot.plot(pen='g', name='GPU Usage')
-        self.ram_curve = self.usage_plot.plot(pen='b', name='RAM Usage')
-        layout.addWidget(self.usage_plot)
+        self.cpu_curve = self.usage_plot.plot(pen='r')
+        self.gpu_curve = self.usage_plot.plot(pen='g')
+        self.ram_curve = self.usage_plot.plot(pen='b')
+        graphs_layout.addWidget(self.usage_plot)
         
-        # Energy Graph
         self.energy_plot = pg.PlotWidget(title="Energy Consumption")
+        self.energy_plot.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.energy_plot.setMinimumHeight(200)
         self.energy_plot.setLabel('left', 'Energy (Wh)')
         self.energy_plot.setLabel('bottom', 'Time (s)')
-        self.energy_plot.addLegend()
-        # Same color scheme as usage graph
-        self.cpu_energy_curve = self.energy_plot.plot(pen='r', name='CPU Energy')
-        self.gpu_energy_curve = self.energy_plot.plot(pen='g', name='GPU Energy')
-        self.ram_energy_curve = self.energy_plot.plot(pen='b', name='RAM Energy')
-        layout.addWidget(self.energy_plot)
+        self.cpu_energy_curve = self.energy_plot.plot(pen='r')
+        self.gpu_energy_curve = self.energy_plot.plot(pen='g')
+        self.ram_energy_curve = self.energy_plot.plot(pen='b')
+        graphs_layout.addWidget(self.energy_plot)
         
-        # CO2 Graph
         self.co2_plot = pg.PlotWidget(title="Cumulative CO2 Emissions")
+        self.co2_plot.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.co2_plot.setMinimumHeight(200)
         self.co2_plot.setLabel('left', 'CO2 (gCO2)')
         self.co2_plot.setLabel('bottom', 'Time (s)')
-        self.co2_curve = self.co2_plot.plot(pen='y', name='Total CO2')
-        layout.addWidget(self.co2_plot)
+        self.co2_curve = self.co2_plot.plot(pen='y')
+        graphs_layout.addWidget(self.co2_plot)
         
-        # Test button
-        self.test_button = QPushButton("Run LLM Test")
-        self.test_button.clicked.connect(self.run_llm_test)
-        layout.addWidget(self.test_button)
+        main_layout.addLayout(graphs_layout)
         
-        # Current values label
+        # Right side: Chat interface
+        chat_layout = QVBoxLayout()
+        
+        # Chat history with updated styling
+        self.chat_history = QTextEdit()
+        self.chat_history.setReadOnly(True)
+        self.chat_history.setStyleSheet("""
+            QTextEdit {
+                background-color: white;
+                border: 1px solid gray;
+                border-radius: 5px;
+                padding: 5px;
+                font-family: 'Segoe UI', Arial, sans-serif;
+                font-size: 12pt;
+                line-height: 1.4;
+            }
+        """)
+        chat_layout.addWidget(self.chat_history)
+        
+        # Input area
+        input_layout = QHBoxLayout()
+        self.chat_input = QLineEdit()
+        self.chat_input.setPlaceholderText("Type your message here...")
+        self.chat_input.returnPressed.connect(self.send_message)
+        input_layout.addWidget(self.chat_input)
+        
+        self.send_button = QPushButton("Send")
+        self.send_button.clicked.connect(self.send_message)
+        input_layout.addWidget(self.send_button)
+        
+        chat_layout.addLayout(input_layout)
+        
+        # Current values display
         self.current_values = QLabel("Current Values:\nCPU: ---%\nGPU: ---%\nRAM: ---%\nEnergy: --- Wh\nCO2: --- gCO2")
-        layout.addWidget(self.current_values)
+        chat_layout.addWidget(self.current_values)
+        
+        main_layout.addLayout(chat_layout)
+        
+        # Set the ratio between graphs and chat (1:1)
+        main_layout.setStretch(0, 1)
+        main_layout.setStretch(1, 1)
 
     def update_graphs(self):
         current_time = time.time() - self.start_time
@@ -434,7 +782,7 @@ class CarbonTrackerGUI(QMainWindow):
                     requests.get("http://localhost:11434")
                     print("✓ Ollama server is running")
                 except requests.exceptions.ConnectionError:
-                    print("✗ Error: Ollama server is not running!")
+                    print(" Error: Ollama server is not running!")
                     print("Please start Ollama server first.")
                     print("Run 'ollama serve' in a terminal")
                     return None
@@ -474,6 +822,199 @@ class CarbonTrackerGUI(QMainWindow):
                 return None
 
         run_test()
+
+    def send_message(self):
+        message = self.chat_input.text().strip()
+        if not message:
+            return
+            
+        self.chat_input.clear()
+        
+        # Add user message with reduced bottom margin
+        self.chat_history.append(f"<div style='margin-bottom: 5px;'><b>You:</b> {message}</div>")
+        
+        # Add "AI is typing..." message
+        self.chat_history.append(
+            "<div id='typing' style='color: #666; margin-bottom: 5px;'>"
+            "AI is thinking..."
+            "</div>"
+        )
+        
+        # Create and start thread for Ollama request
+        self.ollama_thread = OllamaThread(self.llm, message)
+        self.ollama_thread.response_ready.connect(self.handle_response)
+        self.ollama_thread.error_occurred.connect(self.handle_error)
+        self.ollama_thread.start()
+
+    def handle_response(self, response):
+        # Remove the "typing" message and its div
+        cursor = self.chat_history.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.movePosition(QTextCursor.StartOfBlock, QTextCursor.KeepAnchor)
+        cursor.removeSelectedText()
+        cursor.deletePreviousChar()  # Remove the extra newline
+        
+        # Add AI response with consistent spacing
+        self.chat_history.append(
+            f"<div style='margin-bottom: 10px; background-color: #f5f5f5; padding: 10px; border-radius: 5px;'>"
+            f"<b>AI:</b> {response}"
+            f"</div>"
+        )
+        
+        # Scroll to bottom
+        self.chat_history.verticalScrollBar().setValue(
+            self.chat_history.verticalScrollBar().maximum()
+        )
+
+    def handle_error(self, error_message):
+        # Remove the "typing" message
+        cursor = self.chat_history.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.movePosition(QTextCursor.StartOfBlock, QTextCursor.KeepAnchor)
+        cursor.removeSelectedText()
+        
+        # Add error message
+        self.chat_history.append(
+            f"<div style='margin-bottom: 20px; color: #ff0000;'>"
+            f"<b>Error:</b> {error_message}"
+            f"</div>"
+        )
+        
+        # Scroll to bottom
+        self.chat_history.verticalScrollBar().setValue(
+            self.chat_history.verticalScrollBar().maximum()
+        )
+
+    def show_model_selector(self):
+        dialog = ModelSelectorDialog(self)
+        if dialog.exec():
+            selected_model = dialog.get_selected_model()
+            if selected_model:
+                self.switch_model(selected_model)
+
+    def update_system_info(self):
+        specs = self.tracker.specs
+        model_info = self.model_info.get(self.current_model, {
+            "name": self.current_model,
+            "parameters": "Unknown",
+            "context_length": "Unknown"
+        })
+        
+        self.info_label.setText(
+            f"=== System Specifications ===\n"
+            f"CPU: {specs.cpu_model} (TDP: {specs.cpu_tdp}W)\n"
+            f"GPU: {specs.gpu_model} (Type: {specs.gpu_type}, TDP: {specs.gpu_tdp}W)\n"
+            f"RAM: {specs.ram_total_gb:.1f} GB\n\n"
+            f"=== Model Information ===\n"
+            f"LLM: {model_info['name']}\n"
+            f"Parameters: {model_info['parameters']}\n"
+            f"Context Length: {model_info['context_length']}"
+        )
+
+    def download_model(self, model_id):
+        progress = QProgressDialog(f"Downloading model {model_id}...", "Cancel", 0, 0, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setWindowTitle("Downloading Model")
+        progress.setAutoClose(True)
+        progress.setAutoReset(True)
+        progress.show()
+
+        def update_progress(output):
+            if 'downloading' in output.lower():
+                progress.setLabelText(output.strip())
+            elif 'verifying' in output.lower():
+                progress.setLabelText(output.strip())
+            QApplication.processEvents()
+
+        try:
+            process = subprocess.Popen(
+                ['ollama', 'pull', model_id],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True
+            )
+
+            for line in process.stdout:
+                update_progress(line)
+                if progress.wasCanceled():
+                    process.terminate()
+                    return False
+
+            process.wait()
+            if process.returncode == 0:
+                return True
+            else:
+                raise Exception(f"Failed to download model {model_id}")
+        except Exception as e:
+            QMessageBox.critical(self, "Download Error", str(e))
+            return False
+        finally:
+            progress.close()
+
+    def switch_model(self, model_id):
+        try:
+            # First verify the model exists by checking with Ollama API
+            import requests
+            response = requests.get("http://localhost:11434/api/tags")
+            if response.status_code != 200:
+                raise Exception("Failed to connect to Ollama server")
+            
+            installed_models = [model["name"] for model in response.json()["models"]]
+            if model_id not in installed_models:
+                reply = QMessageBox.question(
+                    self,
+                    "Model Not Installed",
+                    f"The model '{model_id}' is not installed. Would you like to download it?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                if reply == QMessageBox.Yes:
+                    if self.download_model(model_id):
+                        # Model downloaded successfully, continue with switch
+                        pass
+                    else:
+                        return False
+                else:
+                    return False
+
+            # If we get here, the model exists and we can switch to it
+            self.llm = Ollama(model=model_id)
+            self.current_model = model_id
+            self.update_system_info()
+            
+            self.chat_history.append(f"Successfully switched to model: {model_id}")
+            return True
+            
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Model Switch Error",
+                f"Failed to switch to model {model_id}. Error: {str(e)}\n\n"
+                f"Make sure the model name is correct (e.g., 'llama2:7b' or 'llama2:1b')."
+            )
+            return False
+
+    def refresh_models(self):
+        try:
+            import requests
+            response = requests.get("http://localhost:11434/api/tags")
+            if response.status_code == 200:
+                models = response.json()["models"]
+                model_list = [model["name"] for model in models]
+                QMessageBox.information(
+                    self,
+                    "Available Models",
+                    "Installed models:\n" + "\n".join(model_list)
+                )
+            else:
+                raise Exception("Failed to fetch models")
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Refresh Error",
+                f"Failed to refresh models. Error: {str(e)}\n\n"
+                "Make sure Ollama is running."
+            )
 
 def main():
     app = QApplication(sys.argv)
